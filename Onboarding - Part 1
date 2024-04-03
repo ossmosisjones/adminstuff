@@ -1,0 +1,75 @@
+<#
+
+    v1
+    # This should create a user account in AD, in the correct OU
+    # as well as a mailbox.
+
+    v2
+    This version added ensuring that the username being created is unique, and tell you
+    if it isn't unique, which will prompt you to enter a middle initial.
+
+    v3
+    This version added checking the last name for dashes and spaces, and removes them.
+    
+#>
+
+# First Name of user
+$firstName = Read-Host "Enter first name"
+
+# Last Name of user
+$lastName = Read-Host "Enter last name"
+# Check name for dashes and spaces
+$a = "$lastName"
+$b = $a -replace '[-]',""
+$userLastName = $b -replace '[ ]',""
+
+$logonCheck = $firstname.Substring(0,1)+$userLastName
+
+# Check to see if user already exists, and if they do, prompt for, and insert, a middle initial
+if (([ADSISearcher] "(sAMAccountName=$logonCheck)").FindOne()){
+    $middleInitial = Read-Host "User with account name >> $logonCheck << already exists. Please enter a middle initial for new user account"
+    $logonName = $firstname.Substring(0,1)+$middleInitial+$userLastName
+    # Full Name of user
+    $fullName = $firstName + " " + $middleInitial + " "  + $lastName
+} else {
+    $logonName = $firstname.Substring(0,1)+$userLastName
+    # Full Name of user
+    $fullName = $firstName + " " + $lastName
+}
+
+# Set email address w/middle initial
+$email = $logonName.ToLower() + "@domain.com"
+
+# Password declaration to be used below
+# Can update later to ask for input to define password, but is static for testing
+$password = '@BasicPW_Goes_Here!'
+
+# Full list of departments
+# Position 1 is to make sure there is a carriage return, and since Arrays start at position 0, but ordinal numbering
+# doesnt't, this helps things match up better when choosing a dept. name based on entering a numerical value below
+
+#Example Departments
+$fullList = @("`n",'Finanace and Administration','Human Resources','Information Technology','Seasonal Staff','Volunteers')
+    
+Write-Host "Which department (OU) should the user be placed in?`n"
+
+# Loop is built so that it nicely displays the numbers to at least 99. I haven't tested for more.
+for($i = 1; $i -lt $fullList.Length; $i++) {
+    if($i -lt 10){
+        Write-Host ""$i "" $fullList[$i]
+    } else {
+        Write-Host $i "" $fullList[$i]
+    }
+}
+
+$deptOU = Read-Host "`nEnter the number for the correct department"
+
+# Enter number for specific department from numbered list
+$fullOU = "<Domain>/Users/" + $fullList[$deptOU]
+
+# Put it all together and create a new remote mailbox for this user
+# I know there's a better way to list all this stuff instead of using a backtick, so I'm all ears for feedback here
+# Is there a way to splat this?
+New-RemoteMailbox -UserPrincipalName $email.ToLower() -Alias $logonName.ToLower() -Name $fullName -FirstName $firstName -LastName $lastName `
+-DisplayName $fullName -OnPremisesOrganizationalUnit "$fullOU" -PrimarySmtpAddress $email.ToLower() -Password (ConvertTo-SecureString $password `
+-AsPlainText -Force) -ResetPasswordOnNextLogon $true
