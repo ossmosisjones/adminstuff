@@ -1,0 +1,190 @@
+<#
+    NOTE: There is another script that creates the user and remote mailbox, Onboarding_pt1.ps1, 
+          that needs to be run directly on the Exchange server and needs to be run first to 
+          create the user and remote mailbox for the rest of this to work.
+
+    Prior to starting my current job, some of the stuff below was already created. Their onboarding process
+    started with a lot of manual data entry into a single script (lines 96-97) for each new user, follow by 
+    a different short script with a lot of manual data entry. All the manual entry and checking to ensure 
+    things went through would take me 30 - 45 minutes, and the most senior person 15ish. Now it takes about
+    3 - 5 min, mostly waiting on things to process.
+
+    Order of operations:
+    1. Collect usernames
+    2. Connect to MSOnline
+    3. Enable MFA and set to "Enforced"
+    4. Copy User A's AD groups and store in param
+    5. Copy User B's AD groups and store in param
+    6. Update User B's group info based on differences between groups
+    7. Copy all user attributes from User A and apply to User B (eg., Description, Street Address, Country, etc...)
+    8. Perform Delta DirSync to sync on prem to O365
+    9. Sleep for 15s to ensure changes go through
+   10. Get all O365 groups from User A, filtered on groups that have an email address, and 
+       shove these into an array.
+       NOTE: This throws errors for mail enable security groups and I'm too lazy to fix this, but worried 
+             every time I see the red and scroll back through to see the error.
+   11. Apply groups to User B
+   12. Run our "Retention Applicator Functions" script that applies retention policy
+   13. Print this list of departments and opt for input from user to determine correct OU
+   14. Ask user which retention policy should be applied, based on departments
+       NOTE: There is a default retention that is applied is user is not in one of 7 specific
+             departments. 
+   15. Set retention policy    
+
+    The script should allow you to enter the user name of the user being copied from and being copied to.
+    NOTE: Both users need to already exist.
+    NOTE: This needs to be run as an admin, and you need RSOP tools installed for AD
+    NOTE: You need to install the Azure module as well >> Install-Module AzureAD
+
+#>
+
+#Parameters
+$sourceAccount = Read-Host "Username being copied FROM"
+$sourceUPN = "$sourceAccount@Domain.com"
+$targetAccount = Read-Host "Username being copied TO"
+$targetUPN = "$targetAccount@Domain.com"
+
+# Capture admin login
+$techUPN = Read-Host "Enter your username (ex. pgibbons)"
+$techUPN += "@Domain.com"
+
+#Collect admin creds, connect to MSOL (Microsoft Online)
+$UserCredential = Get-Credential
+# Uncommend below if you need to import MSOnline, or need to do it every time the script is ran, 
+# for whatever reason. IT can be annoying like that sometimes. 
+# Import-Module MSOnline
+Connect-MsolService -Credential $UserCredential
+
+# Set MFA Status
+$mf = New-Object -TypeName Microsoft.Online.Administration.StrongAuthenticationRequirement
+$mf.RelyingParty = "*"
+$mfa = @($mf)
+
+# Set MFA type to "Enforced"
+$mf.State = "Enforced"
+# Set start date of MFA (should grab date/time script is ran)
+$mf.RememberDevicesNotIssuedBefore = (Get-Date)
+
+Set-MsolUser -UserPrincipalName "$targetUPN" -StrongAuthenticationRequirements $mfa
+
+# Grab each user's group memberships and store in a variable
+$CopyFromUser = Get-ADUser $sourceAccount -prop MemberOf
+$CopyToUser = Get-ADUser $targetAccount -prop MemberOf
+
+# Compare what $cfu belongs to and $ctu doesn't, and true up the difference so that $ctu matches $cfu
+$CopyFromUser.MemberOf | Where-Object { $CopyToUser.MemberOf -notcontains $_ } | Add-ADGroupMember -Members $CopyToUser
+
+
+<#
+ --.v5 Whenever I get to version 5...
+ 
+    Looking to add a bit here about ensuring that onboarded users are excluded from specific
+    groups (ones that require prior authorization), and probably ways to tighten up the code
+
+#>
+
+
+# Array of AD User attributes that will be copied. Add more to the end of this if more attributes need to be copied in the future
+$Users = Get-ADUser $sourceAccount -Properties Description,StreetAddress,City,Country,Title,PostalCode,Office,Department,Manager,State,Company
+
+# ForEach loop to add each attribute to $ctu's AD Object
+foreach ($User in $Users) {
+    try {
+        # Format to add is $User.<AD Attribute> - don't forget to add attribute to above, or define it here like the -Replace option near the end
+        # info="NoPublish" is a custom attribute that is used to ensure that a user's phone number/extension is NOT published to a website
+        # This attribute is set for all staff since they are onboarded before they even get a phone number assigned.
+        Set-aduser -Identity $targetAccount -Description $User.Description -StreetAddress $User.StreetAddress -City $User.City -State $User.state -Country $User.Country -Company $User.Company `
+        -Title $User.Title -PostalCode $User.PostalCode -Office $User.Office -Department $User.Department -Manager $User.Manager -Replace @{info="NoPublish"} -ErrorAction Stop
+        # Write's "Success" to Terminal if successful
+        # I should really make this part output all this into a text file
+        Write-Host "Success"
+    } catch {
+        Write-Warning "$_"
+    }
+}
+
+# Perform a delta DirSync
+Invoke-Command -ComputerName "Your DC" -ScriptBlock {  
+    Start-ADSyncSyncCycle -PolicyType Delta
+}
+
+# Sleep/Pause script so that the DirSync has a chance to apply changes to Azure/M365, before continuing to portion 
+# of script that will do all of the M365 stuff, like adding DL's to user acct; it could likely be set lower.
+Start-Sleep -Seconds 15
+
+# onnect to Azure AD
+Connect-AzureAD 
+ 
+# Get the Source and Target users
+$sourceUser = Get-AzureADUser -Filter "UserPrincipalName eq '$sourceUPN'"
+
+# Might need this at some point to do other things, but currently isn't used
+# $targetUser = Get-AzureADUser -Filter "UserPrincipalName eq '$targetUPN'"
+
+# Get All memberships of the Source user and filter on only objects with an email address
+$sourceMemberships = @(Get-AzureADUserMembership -ObjectId $sourceUser | Where-object { $_.ObjectType -eq "Group" } | 
+                     Select-Object DisplayName, Mail, ObjectId | Where-Object -Property Mail -Like "*@*").Mail
+
+# Connect to ExchangeOnline to add user to groups
+Connect-ExchangeOnline -UserPrincipalName $techUPN
+
+# Loop through list of groups and add user
+for($i = 0; $i -lt $sourceMemberships.Length; $i++){
+$distroList = $sourceMemberships[$i]
+
+Add-DistributionGroupMember -Identity "$distroList" -Member "$targetUPN"
+
+}
+
+# The script below was created before I started working here and haven't yet looked at it
+# to see what it actually does. If I ever remember to look at this, I'll post this too.
+. C:\temp\RetentionTagApplicatorFunctions.ps1
+
+# I'll also need to take a look at the .xml file listed below to see exactly what's going on here.
+Get-Credential -UserName "<Some long number that I'm not exposing to the Internet>" -Message "X" | Export-Clixml c:\temp\O365Tag.xml
+
+$token = Get-GraphBearerToken -Path C:\temp\O365Tag.xml
+
+# Full list attributes may be referring to items in the above XML file, as my script's actual department list is full of the shortened 
+# version, such as HR instead of Human Resources like it's labeled in AD
+$fullList = @("`n","Generic_Group_1","Generic_Group_2","Generic_Group_3","Generic_Group_4","Generic_Group_5","Generic_Group_6",
+            "Generic_Group_7","Generic_Group_8","Generic_Group_9","Generic_Group_10")
+
+# Obtain user input for which retention policy should be applied, and provide a list if choices are unknown
+Write-Host "Which department (OU) should the user be placed in?`n"
+
+# Print full list of all departments with nicely formatted numbering.
+for($i = 1; $i -lt $fullList.Length; $i++) {
+    if($i -lt 10){
+        Write-Host ""$i "" $fullList[$i]
+    } else {
+        Write-Host $i "" $fullList[$i]
+    }
+}
+
+$deptNum = Read-Host "`nEnter the number for the correct department"
+
+$retentionOu = $fullList[$deptNum]
+
+# Checking to see if user input is for one of the 6 specific departments, and if not, set retention to DefaultGroup
+if($retentionOu -eq "Generic_Group_1") {
+$setFolder = "Generic_Group_1_Name"
+} elseif ($retentionOu -eq "Generic_Group_3") {
+$setFolder = "Generic_Group_3_Name"
+} elseif ($retentionOu -eq "Generic_Group_5") {
+$setFolder = "Generic_Group_5_Name"
+} elseif ($retentionOu -eq "Generic_Group_7") {
+$setFolder = "Generic_Group_7_Name"
+} elseif ($retentionOu -eq "Generic_Group_9") {
+$setFolder = "Generic_Group_9_Name"
+} elseif ($retentionOu -eq "Generic_Group_10") {
+$setFolder = "Generic_Group_10_Name"
+} else {
+$setFolder = "DefaultGroup"
+}
+
+# Apply retention policy
+Set-Mailbox $targetAccount.ToLower() -RetentionPolicy "$retentionOu RP"
+
+# Set archive folders
+New-GraphMailArchiveFolders -BearerToken $token -UserPrincipalName $targetUPN.ToLower()  -FolderSet $setFolder
